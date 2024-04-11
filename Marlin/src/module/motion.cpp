@@ -32,6 +32,10 @@
 #include "../gcode/gcode.h"
 #include "../lcd/marlinui.h"
 #include "../inc/MarlinConfig.h"
+#include "../feature/host_actions.h"
+#include "../feature/pause.h"
+#include "../core/serial.h"
+#include "../lcd/marlinui.h"
 
 #if IS_SCARA
   #include "../libs/buzzer.h"
@@ -137,6 +141,8 @@ int16_t feedrate_percentage = 100;
 
 // Cartesian conversion result goes here:
 xyz_pos_t cartes;
+
+uint32 last_ram_success_ms = millis();
 
 #if IS_KINEMATIC
 
@@ -1812,13 +1818,27 @@ void prepare_line_to_destination() {
 
   #endif // SENSORLESS_HOMING
 
+  void await_user_ram_intervention(char* msg) {
+    #if ENABLED(HOST_PROMPT_SUPPORT)
+      if (parser.string_arg)
+        hostui.prompt_do(PROMPT_USER_CONTINUE, msg, FPSTR(CONTINUE_STR));
+      else
+        hostui.prompt_do(PROMPT_USER_CONTINUE, msg, FPSTR(CONTINUE_STR));
+    #endif
+    wait_for_user_response();
+    ui.reset_status();
+  }
+
   /**
    * Home an individual linear axis
    */
-  void do_homing_move(const AxisEnum axis, const float distance, const feedRate_t fr_mm_s=0.0, const bool final_approach=true) {
+  void do_homing_move(const AxisEnum axis, const float distance, const feedRate_t fr_mm_s=0.0, const bool final_approach=true, const uint32_t maxRetries = 8) {
     DEBUG_SECTION(log_move, "do_homing_move", DEBUGGING(LEVELING));
 
+    uint32 start_move_time = millis();
+    float ms_since_last_ram_success = millis() - last_ram_success_ms;
     const feedRate_t home_fr_mm_s = fr_mm_s ?: homing_feedrate(axis);
+    float orig_y = current_position[axis];
 
     if (DEBUGGING(LEVELING)) {
       DEBUG_ECHOPGM("...(", AS_CHAR(AXIS_CHAR(axis)), ", ", distance, ", ");
@@ -1833,6 +1853,8 @@ void prepare_line_to_destination() {
     const int8_t axis_home_dir = TERN0(DUAL_X_CARRIAGE, axis == X_AXIS)
                   ? TOOL_X_HOME_DIR(active_extruder) : home_dir(axis);
     const bool is_home_dir = (axis_home_dir > 0) == (distance > 0);
+    // Super special Y coord == Y_MAX_POS means to check for collisions!
+    bool is_ram_mode = axis == Y_AXIS && orig_y >= (Y_MAX_POS - 0.99) && is_home_dir;
 
     #if ENABLED(SENSORLESS_HOMING)
       sensorless_t stealth_states;
@@ -1863,6 +1885,8 @@ void prepare_line_to_destination() {
       #endif
     }
 
+    // Get the ABC or XYZ positions in mm
+    abce_pos_t target = planner.get_axis_positions_mm();
     #if EITHER(MORGAN_SCARA, MP_SCARA)
       // Tell the planner the axis is at 0
       current_position[axis] = 0;
@@ -1870,9 +1894,6 @@ void prepare_line_to_destination() {
       current_position[axis] = distance;
       line_to_current_position(home_fr_mm_s);
     #else
-      // Get the ABC or XYZ positions in mm
-      abce_pos_t target = planner.get_axis_positions_mm();
-
       target[axis] = 0;                         // Set the single homing axis to 0
       planner.set_machine_position_mm(target);  // Update the machine position
 
@@ -1886,6 +1907,72 @@ void prepare_line_to_destination() {
     #endif
 
     planner.synchronize();
+
+    if (is_ram_mode) {
+      // Calculate how far the homing move traveled before motor kickback signal
+      // based on movement duration since bumped distances aren't really reliable
+      uint32 end_move_time = millis();
+      uint32 move_duration_ms = end_move_time - start_move_time;
+      float expected_move_ms = 1000 * (Y_MAX_POS / home_fr_mm_s) + 500; // +500ms compensates for accel/decel
+      float percent_traveled = (move_duration_ms+0.0) / expected_move_ms;
+
+      // If travel is too low, must have hit something a ram failed to clear!
+      // If expected_move_ms is small, it's a double-bump that can be ignored
+      if ((percent_traveled < 0.93 || percent_traveled > 1.15) && ms_since_last_ram_success > 700) {
+        // Disable stall guard mode for repeating later
+        TERN_(SENSORLESS_HOMING, end_sensorless_homing_per_axis(axis, stealth_states));
+
+        // Artificially set current position with calculated current position, but
+        // assume there may be up to 3% error in timing so error on overly smashing Y back to Y_MAX_POS
+        current_position[axis] = Y_MAX_POS - Y_MAX_POS * min(1.0f, (min(percent_traveled, 1.0f) + 0.03f));
+        cartes[axis] = current_position[axis];
+        sync_plan_position();
+
+        // Recover by moving back to origin and replaying
+        abce_pos_t next_target = planner.get_axis_positions_mm();
+        // Back up about twice as much as you should have to to trade-off between
+        // re-tracking Y position accurately vs grinding the Y axis motor
+        next_target[Y_AXIS] = Y_MAX_POS;
+        //planner.set_machine_position_mm(nextTarget);
+        //planner.buffer_line(nextTarget, home_fr_mm_s / 6, active_extruder);
+        planner.buffer_segment(next_target OPTARG(HAS_DIST_MM_ARG, cart_dist_mm), home_fr_mm_s / 6, active_extruder);
+        planner.synchronize();
+
+        // For some reason the sync above isn't enough, hard-set the current Y position
+        // to max
+        current_position[axis] = Y_MAX_POS;
+        //cartes[axis] = current_position[axis];
+        sync_plan_position();
+
+        if (maxRetries <= 0) {
+          char msg[64];
+          sprintf(msg, "Ram jammed at %.2f%%!", percent_traveled*100);
+          // kill(msg, "", true);
+          await_user_ram_intervention(msg);
+        }
+
+        // Wait 15 minutes before trying again! Maybe a cooler bed on the part will free it?
+        const uint32 DELAY_BETWEEN_RAMS_MS = 1000 * 60 * 15;
+        uint32 now = millis();
+        planner.synchronize();
+        uint32 t = now;
+        while ((t - now) < DELAY_BETWEEN_RAMS_MS) {
+          t = millis();
+          idle(true);
+        }
+
+        do_homing_move(axis, distance, fr_mm_s, final_approach, maxRetries-1);
+        return;
+      }
+      else {
+          // Track last ram success time to fix weird edge case
+          last_ram_success_ms = millis();
+          // Re-enable to help diagnose good timing constants
+          /*char msg[64];
+          sprintf(msg, "Rammed %.2f%%! %i", percent_traveled*100, (int32)maxRetries);
+          kill(msg, "", true);*/
+      }
+    }
 
     if (is_home_dir) {
 
